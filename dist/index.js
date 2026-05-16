@@ -1,5 +1,5 @@
 import { emitFile } from "@typespec/compiler";
-import { collectServices, extractFields, scalarName, isArrayType, isRecordType, isModelType, isUnionType, arrayElementType, recordElementType, toPascalCase, dottedPathToPascalCase, checkAndReportReservedKeywords, safeFieldName, } from "@specodec/typespec-emitter-core";
+import { collectServices, extractFields, scalarName, isArrayType, isRecordType, isModelType, isUnionType, arrayElementType, recordElementType, toPascalCase, checkAndReportReservedKeywords, safeFieldName, } from "@specodec/typespec-emitter-core";
 function typeToFsharp(type) {
     if (isArrayType(type))
         return `ResizeArray<${typeToFsharp(arrayElementType(type))}>`;
@@ -86,22 +86,14 @@ function defaultValue(type) {
         return `Unchecked.defaultof<${type.name}>`;
     return "Unchecked.defaultof<obj>";
 }
-function writeExpr(expr, type, w) {
+function writeExpr(expr, type, w, selfName) {
     if (isArrayType(type)) {
         const elem = arrayElementType(type);
-        return [
-            `${w}.BeginArray(${expr}.Count)`,
-            `${expr} |> Seq.iter (fun item -> ${w}.NextElement(); ${writeExpr("item", elem, w)})`,
-            `${w}.EndArray()`,
-        ].join("\n        ");
+        return `${w}.WriteArray(${expr}, fun ${w} item -> ${writeExpr("item", elem, w, selfName)})`;
     }
     if (isRecordType(type)) {
         const elem = recordElementType(type);
-        return [
-            `${w}.BeginObject(${expr}.Count)`,
-            `${expr} |> Map.iter (fun k v -> ${w}.WriteField(k); ${writeExpr("v", elem, w)})`,
-            `${w}.EndObject()`,
-        ].join("\n        ");
+        return `${w}.WriteMap(${expr}, fun ${w} v -> ${writeExpr("v", elem, w, selfName)})`;
     }
     const n = scalarName(type);
     if (n) {
@@ -133,43 +125,29 @@ function writeExpr(expr, type, w) {
                 return `${w}.WriteBytes(${expr})`;
         }
     }
+    if (isUnionType(type) && type.name) {
+        const name = type.name;
+        const prefix = (name === selfName) ? "" : `${name}Methods.`;
+        return `${prefix}write ${w} ${expr}`;
+    }
+    if (type.kind === "Model" && type.name) {
+        const name = type.name;
+        const prefix = (name === selfName) ? "" : `${name}Methods.`;
+        return `${prefix}write ${w} ${expr}`;
+    }
     if (type.kind === "Enum")
         return `${w}.WriteString(${expr}.ToString())`;
-    if (isUnionType(type) && type.name)
-        return `${type.name}Methods.write ${w} ${expr}`;
-    if (type.kind === "Model" && type.name)
-        return `${type.name}Methods.write ${w} ${expr}`;
     return `// TODO: unknown type`;
 }
-function readExpr(type, r, optional) {
+function readExpr(type, r, optional, selfName) {
     if (isArrayType(type)) {
         const elem = arrayElementType(type);
-        const fsElem = typeToFsharp(elem);
-        const inner = [
-            `(fun () ->`,
-            `    let list = ResizeArray<${fsElem}>()`,
-            `    ${r}.BeginArray()`,
-            `    while ${r}.HasNextElement() do list.Add(${readExpr(elem, r)})`,
-            `    ${r}.EndArray()`,
-            `    list`,
-            `)()`,
-        ].join("\n");
+        const inner = `${r}.ReadArray(fun ${r} -> ${readExpr(elem, r, false, selfName)})`;
         return optional ? `Some(${inner})` : inner;
     }
     if (isRecordType(type)) {
         const elem = recordElementType(type);
-        const fsElem = typeToFsharp(elem);
-        const inner = [
-            `(fun () ->`,
-            `    let dict = System.Collections.Generic.Dictionary<string, ${fsElem}>()`,
-            `    ${r}.BeginObject()`,
-            `    while ${r}.HasNextField() do`,
-            `        let key = ${r}.ReadFieldName()`,
-            `        dict.[key] <- ${readExpr(elem, r)}`,
-            `    ${r}.EndObject()`,
-            `    dict |> Seq.map (fun kvp -> kvp.Key, kvp.Value) |> Map.ofSeq`,
-            `)()`,
-        ].join("\n");
+        const inner = `${r}.ReadMap(fun ${r} -> ${readExpr(elem, r, false, selfName)})`;
         return optional ? `Some(${inner})` : inner;
     }
     const n = scalarName(type);
@@ -215,21 +193,25 @@ function readExpr(type, r, optional) {
         }
         return optional ? `Some(${base})` : base;
     }
-    if (type.kind === "Enum") {
-        const base = `${r}.ReadString()`;
-        return optional ? `Some(${base})` : base;
-    }
     if (isUnionType(type) && type.name) {
-        const decodeCall = `${type.name}Methods.decode ${r}`;
+        const name = type.name;
+        const prefix = (name === selfName) ? "" : `${name}Methods.`;
+        const decodeCall = `${prefix}decode ${r}`;
         if (optional)
             return `if ${r}.IsNull() then (${r}.ReadNull(); None) else Some(${decodeCall})`;
         return decodeCall;
     }
     if (type.kind === "Model" && type.name) {
-        const decodeCall = `${type.name}Methods.decode ${r}`;
+        const name = type.name;
+        const prefix = (name === selfName) ? "" : `${name}Methods.`;
+        const decodeCall = `${prefix}decode ${r}`;
         if (optional)
             return `if ${r}.IsNull() then (${r}.ReadNull(); None) else Some(${decodeCall})`;
         return decodeCall;
+    }
+    if (type.kind === "Enum") {
+        const base = `${r}.ReadString()`;
+        return optional ? `Some(${base})` : base;
     }
     return `Unchecked.defaultof<_>`;
 }
@@ -242,21 +224,18 @@ function generateEnumCode(e) {
     }
     return lines.join("\n");
 }
-function generateModelCode(m, _pkg) {
+function generateModelDecl(m) {
     const fields = extractFields(m);
-    const optionalFields = fields.filter((f) => f.optional);
-    const requiredFields = fields.filter((f) => !f.optional);
-    const allFields = [...requiredFields, ...optionalFields];
     const fsField = (f) => safeFieldName("fsharp", toPascalCase(f.name));
     const lines = [];
     if (fields.length === 0) {
-        lines.push(`type ${m.name} = { }`);
+        lines.push(`type ${m.name} = | ${m.name}`);
     }
     else {
         lines.push(`type ${m.name} = {`);
-        for (let i = 0; i < allFields.length; i++) {
-            const f = allFields[i];
-            const semi = i < allFields.length - 1 ? ";" : "";
+        for (let i = 0; i < fields.length; i++) {
+            const f = fields[i];
+            const semi = i < fields.length - 1 ? ";" : "";
             if (f.optional) {
                 lines.push(`    ${fsField(f)}: option<${typeToFsharp(f.type)}>${semi}`);
             }
@@ -266,9 +245,16 @@ function generateModelCode(m, _pkg) {
         }
         lines.push(`}`);
     }
-    lines.push(``);
+    return lines.join("\n");
+}
+function generateModelMethods(m) {
+    const fields = extractFields(m);
+    const optionalFields = fields.filter((f) => f.optional);
+    const requiredFields = fields.filter((f) => !f.optional);
+    const fsField = (f) => safeFieldName("fsharp", toPascalCase(f.name));
+    const lines = [];
     lines.push(`module ${m.name}Methods =`);
-    lines.push(`    let write (w: SpecWriter) (obj: ${m.name}) =`);
+    lines.push(`    let rec write (w: SpecWriter) (obj: ${m.name}) =`);
     if (optionalFields.length > 0) {
         lines.push(`        let mutable fieldCount = ${requiredFields.length}`);
         for (const f of optionalFields) {
@@ -280,77 +266,91 @@ function generateModelCode(m, _pkg) {
     else {
         lines.push(`        w.BeginObject(${fields.length})`);
     }
-    for (const f of requiredFields) {
+    for (const f of fields) {
         const fname = fsField(f);
-        lines.push(`        w.WriteField("${f.name}"); ${writeExpr(`obj.${fname}`, f.type, "w")}`);
-    }
-    for (const f of optionalFields) {
-        const fname = fsField(f);
-        lines.push(`        match obj.${fname} with`);
-        lines.push(`        | Some v -> w.WriteField("${f.name}"); ${writeExpr("v", f.type, "w")}`);
-        lines.push(`        | None -> ()`);
+        if (f.optional) {
+            lines.push(`        match obj.${fname} with`);
+            lines.push(`        | Some v -> w.WriteField("${f.name}"); ${writeExpr("v", f.type, "w", m.name)}`);
+            lines.push(`        | None -> ()`);
+        }
+        else {
+            lines.push(`        w.WriteField("${f.name}"); ${writeExpr(`obj.${fname}`, f.type, "w", m.name)}`);
+        }
     }
     lines.push(`        w.EndObject()`);
     lines.push(``);
-    lines.push(`    let decode (r: SpecReader) =`);
-    for (const f of fields) {
-        const fname = toPascalCase(f.name);
-        if (f.optional) {
-            lines.push(`        let mutable _${fname} : option<${typeToFsharp(f.type)}> = None`);
+    if (fields.length > 0) {
+        lines.push(`    let rec decode (r: SpecReader) =`);
+        for (const f of fields) {
+            const fname = toPascalCase(f.name);
+            if (f.optional) {
+                lines.push(`        let mutable _${fname} : option<${typeToFsharp(f.type)}> = None`);
+            }
+            else if (isModelType(f.type) || isUnionType(f.type)) {
+                lines.push(`        let mutable _${fname} : option<${typeToFsharp(f.type)}> = None`);
+            }
+            else {
+                lines.push(`        let mutable _${fname} : ${typeToFsharp(f.type)} = ${defaultValue(f.type)}`);
+            }
         }
-        else if (isModelType(f.type) || isUnionType(f.type)) {
-            lines.push(`        let mutable _${fname} : option<${typeToFsharp(f.type)}> = None`);
+        lines.push(`        r.BeginObject()`);
+        lines.push(`        while r.HasNextField() do`);
+        lines.push(`            match r.ReadFieldName() with`);
+        for (const f of fields) {
+            const fname = toPascalCase(f.name);
+            const rExpr = readExpr(f.type, "r", f.optional || isModelType(f.type) || isUnionType(f.type), m.name);
+            lines.push(`            | "${f.name}" -> _${fname} <- ${rExpr}`);
         }
-        else {
-            lines.push(`        let mutable _${fname} : ${typeToFsharp(f.type)} = ${defaultValue(f.type)}`);
-        }
+        lines.push(`            | _ -> r.Skip()`);
+        lines.push(`        r.EndObject()`);
+        const ctorPairs = fields
+            .map((f) => {
+            const fname = toPascalCase(f.name);
+            const ff = fsField(f);
+            if (!f.optional && (isModelType(f.type) || isUnionType(f.type))) {
+                return `${ff} = _${fname}.Value`;
+            }
+            return `${ff} = _${fname}`;
+        })
+            .join("; ");
+        lines.push(`        { ${ctorPairs} }`);
     }
-    lines.push(`        r.BeginObject()`);
-    lines.push(`        while r.HasNextField() do`);
-    lines.push(`            match r.ReadFieldName() with`);
-    for (const f of fields) {
-        const fname = toPascalCase(f.name);
-        const rExpr = readExpr(f.type, "r", f.optional || isModelType(f.type) || isUnionType(f.type));
-        lines.push(`            | "${f.name}" -> _${fname} <- ${rExpr}`);
+    else {
+        lines.push(`    let rec decode (r: SpecReader) =`);
+        lines.push(`        r.BeginObject()`);
+        lines.push(`        while r.HasNextField() do r.Skip()`);
+        lines.push(`        r.EndObject()`);
+        lines.push(`        ${m.name}`);
     }
-    lines.push(`            | _ -> r.Skip()`);
-    lines.push(`        r.EndObject()`);
-    const ctorPairs = allFields
-        .map((f) => {
-        const fname = toPascalCase(f.name);
-        const ff = fsField(f);
-        if (!f.optional && (isModelType(f.type) || isUnionType(f.type))) {
-            return `${ff} = _${fname}.Value`;
-        }
-        return `${ff} = _${fname}`;
-    })
-        .join("; ");
-    lines.push(`        { ${ctorPairs} }`);
     lines.push(``);
     lines.push(`    let codec = SpecCodec<${m.name}>(encode = write, decode = decode)`);
     return lines.join("\n");
 }
-function generateUnionCode(u, L) {
+function generateUnionDecl(u) {
     const unionName = u.name;
-    L.push(`type ${unionName} =`);
+    const lines = [];
+    lines.push(`type ${unionName} =`);
     for (const v of u.variants) {
         const pascalName = toPascalCase(v.name);
-        L.push(`    | ${unionName}${pascalName} of ${typeToFsharp(v.type)}`);
+        lines.push(`    | ${unionName}${pascalName} of ${typeToFsharp(v.type)}`);
     }
-    L.push(`    | Undefined`);
-    L.push(``);
+    lines.push(`    | Undefined`);
+    return lines.join("\n");
+}
+function generateUnionMethods(u, L) {
+    const unionName = u.name;
     L.push(`module ${unionName}Methods =`);
-    L.push(`    let write (w: SpecWriter) (obj: ${unionName}) =`);
+    L.push(`    let rec write (w: SpecWriter) (obj: ${unionName}) =`);
     L.push(`        w.BeginObject(1)`);
     L.push(`        match obj with`);
     for (const v of u.variants) {
         const pascalName = toPascalCase(v.name);
-        L.push(`        | ${unionName}${pascalName} v -> w.WriteField("${v.name}"); ${writeExpr("v", v.type, "w")}`);
+        L.push(`        | ${unionName}${pascalName} v -> w.WriteField("${v.name}"); ${writeExpr("v", v.type, "w", unionName)}`);
     }
     L.push(`        | Undefined -> failwith "cannot encode Undefined for ${unionName}"`);
     L.push(`        w.EndObject()`);
     L.push(``);
-    L.push(`    let decode (r: SpecReader) =`);
+    L.push(`    let rec decode (r: SpecReader) =`);
     L.push(`        r.BeginObject()`);
     L.push(`        if not (r.HasNextField()) then r.EndObject(); failwith "empty union"`);
     L.push(`        let field = r.ReadFieldName()`);
@@ -358,7 +358,7 @@ function generateUnionCode(u, L) {
     L.push(`            match field with`);
     for (const v of u.variants) {
         const pascalName = toPascalCase(v.name);
-        L.push(`            | "${v.name}" -> ${unionName}${pascalName}(${readExpr(v.type, "r")})`);
+        L.push(`            | "${v.name}" -> ${unionName}${pascalName}(${readExpr(v.type, "r", false, unionName)})`);
     }
     L.push(`            | _ -> failwithf "unknown variant %s" field`);
     L.push(`        while r.HasNextField() do r.ReadFieldName() |> ignore; r.Skip()`);
@@ -374,35 +374,33 @@ export async function $onEmit(context) {
     const services = collectServices(program);
     if (checkAndReportReservedKeywords(program, services, ignoreReservedKeywords))
         return;
+    const fileHeader = `// Generated by @specodec/typespec-emitter-fsharp. DO NOT EDIT.
+namespace Specodec.Generated
+
+open Specodec
+open System
+open System.Collections.Generic
+
+`;
     for (const svc of services) {
-        const pkg = svc.serviceName || "GlobalNamespace";
-        const lines = [];
-        lines.push("// Generated by @specodec/typespec-emitter-fsharp. DO NOT EDIT.");
-        if (svc.namespace.name && svc.namespace.name !== "global") {
-            lines.push(`namespace ${dottedPathToPascalCase(pkg)}`);
-        }
-        lines.push(``);
-        lines.push(`open Specodec`);
-        lines.push(`open System`);
-        lines.push(`open System.Collections.Generic`);
-        lines.push(``);
         for (const e of svc.enums) {
             if (!e.name)
                 continue;
-            lines.push(generateEnumCode(e));
-            lines.push(``);
+            const content = fileHeader + generateEnumCode(e) + "\n";
+            await emitFile(program, { path: `${outputDir}/${e.name}.fs`, content });
         }
         for (const m of svc.models) {
             if (!m.name)
                 continue;
-            lines.push(generateModelCode(m, pkg));
-            lines.push(``);
+            const content = fileHeader + generateModelDecl(m) + "\n\n" + generateModelMethods(m) + "\n";
+            await emitFile(program, { path: `${outputDir}/${m.name}.fs`, content });
         }
         for (const u of svc.unions) {
-            generateUnionCode(u, lines);
-            lines.push(``);
+            const lines = [fileHeader, generateUnionDecl(u), ""];
+            generateUnionMethods(u, lines);
+            lines.push("");
+            const content = lines.join("\n");
+            await emitFile(program, { path: `${outputDir}/${u.name}.fs`, content });
         }
-        const fileName = `${dottedPathToPascalCase(svc.serviceName || "GlobalNamespace")}Types.fs`;
-        await emitFile(program, { path: `${outputDir}/${fileName}`, content: lines.join("\n") });
     }
 }
