@@ -155,16 +155,6 @@ function writeExpr(expr: string, type: Type, w: string, selfName?: string): stri
 }
 
 function readExpr(type: Type, r: string, optional?: boolean, selfName?: string): string {
-  if (isArrayType(type)) {
-    const elem = arrayElementType(type)!;
-    const inner = `${r}.ReadArray(fun ${r} -> ${readExpr(elem, r, false, selfName)})`;
-    return optional ? `Some(${inner})` : inner;
-  }
-  if (isRecordType(type)) {
-    const elem = recordElementType(type)!;
-    const inner = `${r}.ReadMap(fun ${r} -> ${readExpr(elem, r, false, selfName)})`;
-    return optional ? `Some(${inner})` : inner;
-  }
   const n = scalarName(type);
   if (n) {
     let base: string;
@@ -297,14 +287,40 @@ function generateModelMethods(m: Model): string {
         lines.push(`        let mutable _${fname} : ${typeToFsharp(f.type)} = ${defaultValue(f.type)}`);
       }
     }
-    lines.push(`        r.BeginObject()`);
-    lines.push(`        while r.HasNextField() do`);
-    lines.push(`            match r.ReadFieldName() with`);
-    for (const f of fields) {
-      const fname = toPascalCase(f.name);
+  let fsharpCounter = 0;
+  lines.push(`        r.BeginObject()`);
+  lines.push(`        while r.HasNextField() do`);
+  lines.push(`            match r.ReadFieldName() with`);
+  for (const f of fields) {
+    const fname = toPascalCase(f.name);
+    const varName = `_${fname}`;
+    if (isArrayType(f.type)) {
+      const elem = arrayElementType(f.type)!;
+      const ft = typeToFsharp(elem);
+      const tmp = `_tmp${fsharpCounter++}`;
+      const rExpr = readExpr(elem, "r", false, m.name);
+      lines.push(`            | "${f.name}" ->`);
+      lines.push(`                let mutable ${tmp} = ResizeArray<${ft}>()`);
+      lines.push(`                r.BeginArray()`);
+      lines.push(`                while r.HasNextElement() do ${tmp}.Add(${rExpr})`);
+      lines.push(`                r.EndArray()`);
+      lines.push(`                ${varName} <- ${tmp}`);
+    } else if (isRecordType(f.type)) {
+      const elem = recordElementType(f.type)!;
+      const ft = typeToFsharp(elem);
+      const tmp = `_tmp${fsharpCounter++}`;
+      const rExpr = readExpr(elem, "r", false, m.name);
+      lines.push(`            | "${f.name}" ->`);
+      lines.push(`                let mutable ${tmp} = Map.empty<string, ${ft}>`);
+      lines.push(`                r.BeginObject()`);
+      lines.push(`                while r.HasNextField() do ${tmp} <- ${tmp}.Add(r.ReadFieldName(), ${rExpr})`);
+      lines.push(`                r.EndObject()`);
+      lines.push(`                ${varName} <- ${tmp}`);
+    } else {
       const rExpr = readExpr(f.type, "r", f.optional || isModelType(f.type) || isUnionType(f.type), m.name);
-      lines.push(`            | "${f.name}" -> _${fname} <- ${rExpr}`);
+      lines.push(`            | "${f.name}" -> ${varName} <- ${rExpr}`);
     }
+  }
     lines.push(`            | _ -> r.Skip()`);
     lines.push(`        r.EndObject()`);
     const ctorPairs = fields
