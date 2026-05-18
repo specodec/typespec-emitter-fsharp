@@ -297,7 +297,7 @@ function generateModelMethods(m: Model): string {
     if (isArrayType(f.type)) {
       const elem = arrayElementType(f.type)!;
       const ft = typeToFsharp(elem);
-      const tmp = `_tmp${fsharpCounter++}`;
+      const tmp = `_tmp`;
       const rExpr = readExpr(elem, "r", false, m.name);
       lines.push(`            | "${f.name}" ->`);
       lines.push(`                let mutable ${tmp} = ResizeArray<${ft}>()`);
@@ -308,7 +308,7 @@ function generateModelMethods(m: Model): string {
     } else if (isRecordType(f.type)) {
       const elem = recordElementType(f.type)!;
       const ft = typeToFsharp(elem);
-      const tmp = `_tmp${fsharpCounter++}`;
+      const tmp = `_tmp`;
       const rExpr = readExpr(elem, "r", false, m.name);
       lines.push(`            | "${f.name}" ->`);
       lines.push(`                let mutable ${tmp} = Map.empty<string, ${ft}>`);
