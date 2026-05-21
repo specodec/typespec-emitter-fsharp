@@ -23,7 +23,7 @@ import {
 
 export type EmitterOptions = BaseEmitterOptions;
 
-function typeToFsharp(type: Type): string {
+export function typeToFsharp(type: Type): string {
   if (isArrayType(type)) return `ResizeArray<${typeToFsharp(arrayElementType(type)!)}>`;
   if (isRecordType(type)) return `Map<string, ${typeToFsharp(recordElementType(type)!)}>`;
   const n = scalarName(type);
@@ -62,7 +62,7 @@ function typeToFsharp(type: Type): string {
   return "obj";
 }
 
-function defaultValue(type: Type): string {
+export function defaultValue(type: Type): string {
   if (isArrayType(type)) return `ResizeArray<${typeToFsharp(arrayElementType(type)!)}>()`;
   if (isRecordType(type)) return "Map.empty";
   const n = scalarName(type);
@@ -101,7 +101,7 @@ function defaultValue(type: Type): string {
   return "Unchecked.defaultof<obj>";
 }
 
-function writeExpr(expr: string, type: Type, w: string, selfName?: string): string {
+export function writeExpr(expr: string, type: Type, w: string, selfName?: string): string {
   if (isArrayType(type)) {
     const elem = arrayElementType(type)!;
     return `${w}.WriteArray(${expr}, fun ${w} item -> ${writeExpr("item", elem, w, selfName)})`;
@@ -154,7 +154,7 @@ function writeExpr(expr: string, type: Type, w: string, selfName?: string): stri
   return `// TODO: unknown type`;
 }
 
-function readExpr(type: Type, r: string, optional?: boolean, selfName?: string): string {
+export function readExpr(type: Type, r: string, optional?: boolean, selfName?: string): string {
   const n = scalarName(type);
   if (n) {
     let base: string;
@@ -211,7 +211,7 @@ function readExpr(type: Type, r: string, optional?: boolean, selfName?: string):
   return `Unchecked.defaultof<_>`;
 }
 
-function generateEnumCode(e: EnumInfo): string {
+export function generateEnumCode(e: EnumInfo): string {
   const lines: string[] = [];
   lines.push(`type ${e.name} =`);
   for (let i = 0; i < e.members.length; i++) {
@@ -221,7 +221,7 @@ function generateEnumCode(e: EnumInfo): string {
   return lines.join("\n");
 }
 
-function generateModelDecl(m: Model): string {
+export function generateModelDecl(m: Model): string {
   const fields = extractFields(m);
   const fsField = (f: FieldInfo) => safeFieldName("fsharp", toPascalCase(f.name));
   const lines: string[] = [];
@@ -244,7 +244,7 @@ function generateModelDecl(m: Model): string {
   return lines.join("\n");
 }
 
-function generateModelMethods(m: Model): string {
+export function generateModelMethods(m: Model): string {
   const fields = extractFields(m);
   const optionalFields = fields.filter((f) => f.optional);
   const requiredFields = fields.filter((f) => !f.optional);
